@@ -6,7 +6,7 @@ from rest_framework.test import APIClient
 
 from bsmain.models import AuthToken
 from projects.models import Project
-from issues.models import Issue
+from issues.models import Issue, TurningPoint, TurningPointKind
 from issues.factories import get_or_create_issue
 from events.factories import create_event_data
 
@@ -166,3 +166,71 @@ class IssuePaginationTests(TransactionTestCase):
         r2 = self.client.get(r1.json()["next"])
         self.assertEqual(
             self._ids(r2), [str(self._idx_by_last_seen(issues, 2)), str(self._idx_by_last_seen(issues, 1))])
+
+
+class IssueResolveApiTests(TransactionTestCase):
+    def setUp(self):
+        self.client = APIClient()
+        token = AuthToken.objects.create()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+        self.project = Project.objects.create(name="Test Project")
+        data = create_event_data(exception_type="TestError")
+        self.issue, _ = get_or_create_issue(project=self.project, event_data=data)
+
+    def _resolve_url(self, issue_id):
+        return reverse("api:issue-resolve", args=[issue_id])
+
+    def test_resolve_issue(self):
+        response = self.client.post(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["is_resolved"])
+
+        self.issue.refresh_from_db()
+        self.assertTrue(self.issue.is_resolved)
+
+    def test_resolve_creates_turning_point(self):
+        self.client.post(self._resolve_url(self.issue.id))
+
+        tp = TurningPoint.objects.get(issue=self.issue, kind=TurningPointKind.RESOLVED)
+        self.assertIsNone(tp.user)
+        self.assertEqual(tp.project, self.project)
+
+    def test_resolve_already_resolved_returns_409(self):
+        self.client.post(self._resolve_url(self.issue.id))
+        response = self.client.post(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "Issue is already resolved.")
+
+    def test_resolve_muted_issue_also_unmutes(self):
+        Issue.objects.filter(id=self.issue.id).update(is_muted=True)
+        self.issue.refresh_from_db()
+
+        response = self.client.post(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 200)
+
+        self.issue.refresh_from_db()
+        self.assertTrue(self.issue.is_resolved)
+        self.assertFalse(self.issue.is_muted)
+
+    def test_resolve_deleted_issue_returns_404(self):
+        Issue.objects.filter(id=self.issue.id).update(is_deleted=True)
+        response = self.client.post(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 404)
+
+    def test_resolve_nonexistent_issue_returns_404(self):
+        import uuid
+        response = self.client.post(self._resolve_url(uuid.uuid4()))
+        self.assertEqual(response.status_code, 404)
+
+    def test_resolve_requires_auth(self):
+        unauthed = APIClient()
+        response = unauthed.post(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 401)
+
+    def test_resolve_only_accepts_post(self):
+        response = self.client.get(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 405)
+
+        response = self.client.put(self._resolve_url(self.issue.id))
+        self.assertEqual(response.status_code, 405)

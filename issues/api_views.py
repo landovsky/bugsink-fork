@@ -1,13 +1,18 @@
+import json
+
 from django.shortcuts import get_object_or_404
-from rest_framework import viewsets
+from django.utils import timezone
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
 from rest_framework.pagination import CursorPagination
 from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiTypes
 
 from bugsink.api_mixins import AtomicRequestMixin
 from bugsink.utils import assert_
 
-from .models import Issue
+from .models import Issue, IssueStateManager, TurningPoint, TurningPointKind
 from .serializers import IssueSerializer
 
 
@@ -132,3 +137,31 @@ class IssueViewSet(AtomicRequestMixin, viewsets.ReadOnlyModelViewSet):
         obj = get_object_or_404(queryset, **filter_kwargs)
         self.check_object_permissions(self.request, obj)
         return obj
+
+    @extend_schema(
+        request=None,
+        responses={200: IssueSerializer},
+        description="Resolve (close) an issue. Returns 409 if the issue is already resolved.",
+    )
+    @action(detail=True, methods=["post"], url_path="resolve")
+    def resolve(self, request, pk=None):
+        issue = self.get_object()
+
+        if issue.is_resolved:
+            return Response(
+                {"detail": "Issue is already resolved."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        TurningPoint.objects.create(
+            project=issue.project,
+            issue=issue,
+            kind=TurningPointKind.RESOLVED,
+            user=None,  # API token auth → no user
+            metadata=json.dumps({"resolved_unconditionally": True}),
+            timestamp=timezone.now(),
+        )
+        IssueStateManager.resolve(issue)
+        issue.save()
+
+        return Response(IssueSerializer(issue).data)
